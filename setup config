@@ -1,0 +1,7 @@
+export ELEVENLABS_API_KEY="sk_6f8236db23464d5a4288310b8e0fbdb9c0990b17a78997cf"
+export ELEVENLABS_AGENT_ID="agent_2401m209dgv9eze99h2yx74q24dp"
+export ANTHROPIC_API_KEY="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"
+source ~/unitree_ros2/setup.sh
+
+export MIC=alsa_input.usb-046d_Brio_100_2414ap01mam8-02.mono-fallback
+export SPK=alsa_output.usb-Generic_AB13X_USB_Audio_20210926172016-00.stereo-fallback
