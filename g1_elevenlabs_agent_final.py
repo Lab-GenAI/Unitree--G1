@@ -140,9 +140,20 @@ class SoundDeviceAudioInterface(AudioInterface):
     def __init__(self, input_device=None, output_device=None,
                  input_rate=INPUT_RATE, output_rate=OUTPUT_RATE,
                  agent_rate=ELEVENLABS_RATE,
-                 verbose=False, push_to_talk=True, echo_guard=False):
+                 verbose=False, push_to_talk=True, echo_guard=False,
+                 duck_factor=0.08, input_name=None, output_name=None,
+                 watchdog=True):
         self.input_device = input_device
         self.output_device = output_device
+        # Device NAME substrings, used by the watchdog to find the devices
+        # again if a USB audio device drops off the bus and comes back with a
+        # different index. None = device was forced by index, don't re-resolve.
+        self.input_name = input_name
+        self.output_name = output_name
+        self._last_in_cb = time.time()
+        self._last_out_cb = time.time()
+        self._wd_run = False
+        self.watchdog = watchdog
         self.input_rate = input_rate
         self.output_rate = output_rate
         self.agent_rate = agent_rate
@@ -170,6 +181,24 @@ class SoundDeviceAudioInterface(AudioInterface):
         # agent triggers on itself.
         self.echo_guard = echo_guard
         self._speaking_until = 0.0
+
+        # DUCKING
+        # PulseAudio's module-echo-cancel did not work here - two USB devices
+        # on independent clocks defeated it (measured rms 725 on a silent
+        # capture, i.e. no cancellation at all). So instead of subtracting
+        # the speaker signal, attenuate the mic hard while the robot talks.
+        #
+        # The robot's own voice arriving at the mic drops below the agent's
+        # VAD threshold and never triggers. A person speaking is far louder
+        # at the mic than the speaker bleed, so they still get through.
+        # Interruption survives - unlike a hard gate.
+        #
+        # This is a level trick, not cancellation. If the speaker is loud and
+        # the speaker is far from the mic, bleed and speech converge and no
+        # setting separates them. A directional mic is the real fix then.
+        self.duck_factor = duck_factor
+        self._meter_enabled = False
+        self._meter_last = 0.0
 
         self._in_stream = None
         self._out_stream = None
@@ -226,6 +255,30 @@ class SoundDeviceAudioInterface(AudioInterface):
         )
 
     # ---------- push to talk ----------
+    def _duck(self, chunk):
+        """Attenuate mic audio while the robot is speaking."""
+        if self.push_to_talk or self.duck_factor >= 1.0:
+            return chunk
+        if not self.is_speaking():
+            return chunk
+        a = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        a *= self.duck_factor
+        return a.astype(np.int16).tobytes()
+
+    def _meter(self, chunk):
+        """Print mic level so ducking can be tuned against real numbers."""
+        if not self._meter_enabled:
+            return
+        now = time.time()
+        if now - self._meter_last < 0.25:
+            return
+        self._meter_last = now
+        a = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt((a * a).mean())) if a.size else 0.0
+        bar = "#" * min(40, int(rms / 100))
+        tag = "SPEAKING" if self.is_speaking() else "        "
+        print(f"  [mic {tag}] rms={rms:7.0f} {bar}", flush=True)
+
     def is_speaking(self):
         """True while the robot still has audio to play, plus a short tail so
         the speaker's decay does not get transcribed."""
@@ -245,44 +298,35 @@ class SoundDeviceAudioInterface(AudioInterface):
         return True
 
     # ---------- capture ----------
-    def start(self, input_callback):
-        self._input_callback = input_callback
-
-        def on_audio(indata, frames, time_info, status):
-            if status and self.verbose:
-                print(f"[input status] {status}", file=sys.stderr)
-            if not self._input_callback:
-                return
-            muted_by_echo = (self.echo_guard
-                             and not self.push_to_talk
-                             and self.is_speaking())
-
-            if self.mic_open.is_set() and not muted_by_echo:
+    def _on_audio(self, indata, frames, time_info, status):
+        self._last_in_cb = time.time()
+        if status and self.verbose:
+            print(f"[input status] {status}", file=sys.stderr)
+        if not self._input_callback:
+            return
+        try:
+            if self.mic_open.is_set():
                 # Hardware mic is 48 kHz; ElevenLabs receives true 16-kHz PCM.
                 chunk = self._mic_to_agent_rate(bytes(indata))
                 if chunk:
+                    chunk = self._duck(chunk)
+                    self._meter(chunk)
                     self._input_callback(chunk)
             else:
                 # Feed silence at the ELEVENLABS rate, not the hardware rate.
                 # 960 frames @ 48 kHz = 20 ms = 320 samples @ 16 kHz.
-                silence_samples = round(frames * self.agent_rate / self.input_rate)
+                silence_samples = round(frames * self.agent_rate
+                                        / self.input_rate)
                 self._input_callback(b"\x00" * (silence_samples * 2))
+        except Exception as e:
+            print(f"[AUDIO] input callback error: {e}", file=sys.stderr)
 
-        self._in_stream = sd.RawInputStream(
-            samplerate=self.input_rate,
-            blocksize=CHUNK_FRAMES,
-            device=self.input_device,
-            channels=1,
-            dtype="int16",
-            callback=on_audio,
-        )
-        self._in_stream.start()
-
-        # ---------- playback ----------
-        def on_output(outdata, frames, time_info, status):
-            if status and self.verbose:
-                print(f"[output status] {status}", file=sys.stderr)
-            needed = frames * 2          # int16 mono
+    def _on_output(self, outdata, frames, time_info, status):
+        self._last_out_cb = time.time()
+        if status and self.verbose:
+            print(f"[output status] {status}", file=sys.stderr)
+        needed = frames * 2          # int16 mono
+        try:
             buf = self._residual
             while len(buf) < needed:
                 try:
@@ -296,27 +340,136 @@ class SoundDeviceAudioInterface(AudioInterface):
                 outdata[:len(buf)] = buf
                 outdata[len(buf):] = b"\x00" * (needed - len(buf))
                 self._residual = b""
+        except Exception as e:
+            # An exception escaping a PortAudio callback aborts the stream
+            # for good - the speaker would go permanently silent with the
+            # rest of the program still running. Log it, play silence, live.
+            print(f"[AUDIO] output callback error: {e}", file=sys.stderr)
+            try:
+                outdata[:] = b"\x00" * needed
+            except Exception:
+                pass
 
+    def _open_in(self):
+        self._in_stream = sd.RawInputStream(
+            samplerate=self.input_rate,
+            blocksize=CHUNK_FRAMES,
+            device=self.input_device,
+            channels=1,
+            dtype="int16",
+            callback=self._on_audio,
+        )
+        self._last_in_cb = time.time()
+        self._in_stream.start()
+
+    def _open_out(self):
         self._out_stream = sd.RawOutputStream(
             samplerate=self.output_rate,
             blocksize=CHUNK_FRAMES,
             device=self.output_device,
             channels=1,
             dtype="int16",
-            callback=on_output,
+            callback=self._on_output,
         )
+        self._last_out_cb = time.time()
         self._out_stream.start()
 
-    def stop(self):
-        self._input_callback = None
+    def start(self, input_callback):
+        self._input_callback = input_callback
+        self._open_in()
+        self._open_out()
+        if self.watchdog:
+            self._wd_run = True
+            threading.Thread(target=self._watchdog, daemon=True).start()
+        print(f"[AUDIO] streams open: in={self.input_device} "
+              f"out={self.output_device} "
+              f"(watchdog {'on' if self.watchdog else 'OFF'})", flush=True)
+
+    # ---------- self-healing ----------
+    def _close_streams(self):
         for s in (self._in_stream, self._out_stream):
             if s is not None:
                 try:
                     s.stop()
+                except Exception:
+                    pass
+                try:
                     s.close()
                 except Exception:
                     pass
         self._in_stream = self._out_stream = None
+
+    def _reopen_all(self, why):
+        """Tear both streams down, make PortAudio re-scan the USB bus, find
+        the devices again by NAME and reopen. Both are rebuilt together
+        because re-initialising PortAudio invalidates every open stream."""
+        print(f"[AUDIO] {why} - restarting audio streams", flush=True)
+        self._close_streams()
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            print(f"[AUDIO] couldn't re-scan devices: {e}")
+        if self.input_name:
+            idx, name = find_device(self.input_name, "input",
+                                    retries=3, delay=0.5)
+            if idx is not None:
+                self.input_device = idx
+        if self.output_name:
+            idx, name = find_device(self.output_name, "output",
+                                    retries=3, delay=0.5)
+            if idx is not None:
+                self.output_device = idx
+        try:
+            self._open_in()
+            self._open_out()
+            print(f"[AUDIO] recovered (in={self.input_device} "
+                  f"out={self.output_device})", flush=True)
+            return True
+        except Exception as e:
+            print(f"[AUDIO] reopen failed: {e}", flush=True)
+            self._close_streams()
+            return False
+
+    def _watchdog(self):
+        """Notice a dead stream and rebuild it. Added after the speaker went
+        silent for good partway through a walk while everything else (agent,
+        transcripts, tools) carried on. Both streams run callbacks
+        continuously - even when idle they play/feed silence - so a stream
+        that is inactive, or hasn't called back for 2 s, is dead.
+        If this fires, `dmesg -T | tail -30` right after will usually show
+        the USB device that dropped."""
+        last_try = 0.0
+        while self._wd_run:
+            time.sleep(1.0)
+            if not self._wd_run:
+                break
+            now = time.time()
+            why = None
+            for kind, stream, last in (
+                    ("output", self._out_stream, self._last_out_cb),
+                    ("input", self._in_stream, self._last_in_cb)):
+                if stream is None:
+                    why = f"{kind} stream missing"
+                    break
+                try:
+                    active = stream.active
+                except Exception:
+                    active = False
+                if not active:
+                    why = f"{kind} stream stopped"
+                    break
+                if now - last > 2.0:
+                    why = f"{kind} stream silent for {now - last:.1f}s"
+                    break
+            if why and now - last_try > 3.0:
+                last_try = now
+                self._reopen_all(why)
+
+    def stop(self):
+        self._wd_run = False
+        self._input_callback = None
+        self._close_streams()
         self.interrupt()
 
     def output(self, audio):
@@ -377,10 +530,50 @@ def push_to_talk_loop(audio, stopping):
         else:
             print("  [mic CLOSED]  press ENTER to talk\n")
 
+# --- tool-skip backstop -------------------------------------------------
+# The model sometimes SAYS "on my way to screen one" and never calls
+# humanoid_output, so the robot stands still. We watch each user turn: if no
+# tool call arrives within FALLBACK_SECONDS and the user's words were a clear
+# go-to-a-saved-place (or stop) request, we do it ourselves.
+FALLBACK_SECONDS = 3.5
+_turn = {"text": None, "tool": False, "fallback_at": 0.0}
+
+
+def on_user_transcript(text):
+    print(f"You:   {text}")
+    _turn["text"] = text
+    _turn["tool"] = False
+    t = threading.Timer(FALLBACK_SECONDS, _fallback_check, args=(text,))
+    t.daemon = True
+    t.start()
+
+
+def _fallback_check(text):
+    if _turn["text"] != text or _turn["tool"] or not ROBOT_AVAILABLE:
+        return
+    try:
+        hit = g1_robot.intent_fallback(text)
+    except Exception as e:
+        print(f"[FALLBACK] intent check failed: {e}")
+        return
+    if not hit:
+        return
+    action, dest = hit
+    print(f"[FALLBACK] agent spoke but never called the tool for {text!r} "
+          f"- doing {action} {dest or ''}")
+    _turn["fallback_at"] = time.time()
+    try:
+        result = g1_robot.dispatch(action, dest, "")
+        print(f"[ROBOT] (fallback) {action} -> {result}")
+    except Exception as e:
+        print(f"[FALLBACK] dispatch failed: {e}")
+
+
 def humanoid_output(parameters):
     """The agent's single tool. It SPEAKS `reply` itself; we execute the
     action here and return a short status string back to the agent.
     """
+    _turn["tool"] = True
     data = {
         "reply": parameters.get("reply", ""),
         "action": parameters.get("action", "none"),
@@ -391,6 +584,14 @@ def humanoid_output(parameters):
     if not ROBOT_AVAILABLE:
         return "Robot control unavailable."
 
+    if (data["action"] == "navigate"
+            and time.time() - _turn["fallback_at"] < 20.0):
+        print("[ROBOT] navigate already started by the fallback - skipping "
+              "the duplicate")
+        return ("Already heading there. STARTED - you have NOT arrived. Say "
+                "nothing more about it; a [NAV] note will tell you when you "
+                "really get there.")
+
     try:
         result = g1_robot.dispatch(
             data["action"], data["destination"], data["reply"])
@@ -400,6 +601,41 @@ def humanoid_output(parameters):
 
     print(f"[ROBOT] {data['action']} -> {result}")
     return result
+
+def look(parameters):
+    """Dedicated vision tool.
+
+    WHY THIS IS SEPARATE FROM humanoid_output
+    -----------------------------------------
+    humanoid_output carries a `reply` that the agent speaks immediately. The
+    tool result comes back afterwards, so a description returned that way
+    arrives too late to be spoken in the same turn - which is why vision
+    appeared not to work at all.
+
+    This tool returns ONLY the description and nothing to speak up front. The
+    agent calls it, receives what the camera saw, and speaks that. One turn,
+    no filler.
+
+    No keyword matching anywhere. The agent decides when looking is called
+    for - "what do you see", "how do I look", "is anyone there", "what colour
+    is this", "read that sign" - all of it is its judgement, not a string
+    match on our side.
+    """
+    question = (parameters or {}).get("question", "") or "What do you see?"
+    print(f"[LOOK] {question}")
+
+    if not ROBOT_AVAILABLE:
+        return "My camera isn't available right now."
+
+    try:
+        description = g1_robot.describe_view(question)
+    except Exception as e:
+        print(f"[LOOK] failed: {e}")
+        return ("I couldn't get a picture from my camera just now.")
+
+    print(f"[LOOK] -> {description}")
+    return description
+
 
 def main():
     ap = argparse.ArgumentParser(description="ElevenLabs agent pipeline test")
@@ -418,6 +654,13 @@ def main():
     ap.add_argument("--push-to-talk", action="store_true",
                     help="ENTER-gated capture instead of the default "
                          "always-on wake-word mode")
+    ap.add_argument("--duck", type=float, default=0.08, metavar="F",
+                    help="mic attenuation while the robot speaks, 0.0-1.0. "
+                         "Lower suppresses the robot's own voice harder; too "
+                         "low and you cannot interrupt either. 1.0 disables. "
+                         "Default 0.08")
+    ap.add_argument("--meter", action="store_true",
+                    help="print live mic rms - use it to tune --duck")
     ap.add_argument("--echo-guard", action="store_true",
                     help="mute the mic while the robot speaks. OFF by "
                          "default: gating is half duplex, so it would make "
@@ -431,6 +674,24 @@ def main():
                     help="voice only - skip DDS, actions and navigation")
     ap.add_argument("--no-nav", action="store_true",
                     help="skip NavBridge (drops the /slam_info subscription)")
+    ap.add_argument("--no-audio-watchdog", action="store_true",
+                    help="disable the self-healing audio watchdog. Use it "
+                         "to rule the watchdog out if the speaker is silent.")
+    ap.add_argument("--guard-mode", choices=["per-walk", "persistent"],
+                    default="per-walk",
+                    help="per-walk (default): the RealSense is opened at the "
+                         "start of each walk and closed at the end. "
+                         "persistent: opened once at startup and left "
+                         "streaming (released only while pickup_glass / "
+                         "measure use the camera). Try persistent if the "
+                         "speaker cuts out when a walk starts - see "
+                         "g1_audio_diag.py.")
+    ap.add_argument("--no-obstacle-guard", action="store_true",
+                    help="disable the RealSense-based dodge-and-continue "
+                         "obstacle avoidance - navigate() falls back to a "
+                         "straight walk with no avoidance, same as before "
+                         "it existed. Use this if the guard misbehaves and "
+                         "you need navigation back immediately.")
     ap.add_argument("--list-actions", action="store_true",
                     help="print every valid action value and exit")
     args = ap.parse_args()
@@ -489,10 +750,15 @@ def main():
         verbose=args.verbose,
         push_to_talk=args.push_to_talk,
         echo_guard=args.echo_guard,
+        duck_factor=args.duck,
+        input_name=args.mic_name if args.input_device is None else None,
+        output_name=args.speaker_name if args.output_device is None else None,
+        watchdog=not args.no_audio_watchdog,
     )
 
     client_tools = ClientTools()
     client_tools.register("humanoid_output", humanoid_output)
+    client_tools.register("look", look)
 
     client = ElevenLabs(api_key=api_key)
     conversation = Conversation(
@@ -501,7 +767,7 @@ def main():
         requires_auth=True,
         client_tools=client_tools,
         audio_interface=audio,
-        callback_user_transcript=lambda t: print(f"You:   {t}"),
+        callback_user_transcript=on_user_transcript,
         callback_agent_response=lambda r: print(f"Agent: {r}"),
         callback_agent_response_correction=(
             lambda orig, corr: print(f"Agent: {orig} -> {corr}")),
@@ -522,6 +788,15 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    audio._meter_enabled = args.meter
+
+    # Persistent guard: the RealSense must start BEFORE any audio stream is
+    # open - starting it kills a USB speaker that is already playing (see
+    # g1_audio_diag.py). The 2 s settle inside this call is deliberate.
+    if (args.guard_mode == "persistent" and ROBOT_AVAILABLE
+            and not args.no_robot and not args.no_obstacle_guard):
+        g1_robot.preopen_camera_guard()
+
     print("Session starting...\n")
     t0 = time.time()
     try:
@@ -531,7 +806,19 @@ def main():
         # first floods the interpreter and the handshake times out.
         if ROBOT_AVAILABLE and not args.no_robot:
             print("\nBringing up robot interfaces...")
-            g1_robot.init(args.iface, use_nav=not args.no_nav)
+            # Lets background work (nav arrival, an RPS result, a grasp
+            # confirmation) speak into this session on its own - see
+            # g1_robot.announce(). Registered before init() so NavBridge's
+            # on_event has somewhere to send its very first message.
+            g1_robot.set_conversation(conversation)
+            g1_robot.init(args.iface, use_nav=not args.no_nav,
+                         use_obstacle_guard=not args.no_obstacle_guard,
+                         guard_persistent=(args.guard_mode == "persistent"))
+            problem = g1_robot.vision_status()
+            if problem:
+                print(f"[ROBOT] VISION UNAVAILABLE: {problem}")
+            else:
+                print("[ROBOT] vision ready (Brio + Claude)")
             print()
         elif args.no_robot:
             print("Robot control disabled (--no-robot).\n")
@@ -545,9 +832,13 @@ def main():
         else:
             print("=" * 58)
             print("  ALWAYS ON - start with the wake word, e.g. 'hey Tony'")
-            guard = "on (voice interruption disabled)" if args.echo_guard \
-                else "off - you can interrupt mid-sentence"
-            print(f"  Echo guard: {guard}")
+            if args.echo_guard:
+                print("  Echo guard: HARD GATE - cannot interrupt by voice")
+            elif args.duck < 1.0:
+                print(f"  Ducking: mic at {args.duck:.0%} while speaking "
+                      "- interruption still works")
+            else:
+                print("  Ducking: off")
             print("  Ctrl-C to stop.")
             print("=" * 58 + "\n")
 
